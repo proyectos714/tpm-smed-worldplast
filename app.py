@@ -93,11 +93,18 @@ def read_google_sheet():
             live_df = live_df[valid_id].copy()
             live_df[id_col] = live_df[id_col].fillna("").astype(str).str.strip()
 
-        # Classify simulations using the whole row, so a shifted/missing column does not hide a test.
+        # Classify simulations robustly using the event ID and the full row.
+        # The TEST-TPM prefix is decisive even if other columns are blank or shifted.
         def is_simulated(row):
+            id_value = ""
+            for column in live_df.columns:
+                if str(column).strip().casefold() == "id_evento":
+                    id_value = str(row.get(column, "") if pd.notna(row.get(column, pd.NA)) else "").strip().upper()
+                    break
             values = " ".join(str(v) for v in row.tolist() if pd.notna(v)).upper()
             return (
-                "TEST-TPM-" in values
+                id_value.startswith("TEST-TPM-")
+                or "TEST-TPM-" in values
                 or "PRUEBA SIMULADA" in values
                 or "FICTICIO" in values
                 or "SIMULAD" in values
@@ -261,9 +268,17 @@ elif page == "Datos de Google Sheets":
         if live_df.empty:
             st.warning("La pestaña existe, pero no contiene registros con ID_Evento.")
         else:
-            simulated_mask = live_df.get(
+            # Recheck using IDs at display time too, so the KPI and visible table agree.
+            id_column = next((c for c in live_df.columns if str(c).strip().casefold() == "id_evento"), None)
+            id_simulated_mask = (
+                live_df[id_column].fillna("").astype(str).str.strip().str.upper().str.startswith("TEST-TPM-")
+                if id_column is not None else pd.Series(False, index=live_df.index)
+            )
+            row_simulated_mask = live_df.get(
                 "Clasificacion_Sistema", pd.Series("Pendiente de clasificación", index=live_df.index)
             ).eq("Prueba simulada")
+            simulated_mask = id_simulated_mask | row_simulated_mask
+            live_df["Clasificacion_Sistema"] = np.where(simulated_mask, "Prueba simulada", "Pendiente de clasificación")
             simulated_count = int(simulated_mask.sum())
             unclassified_count = int((~simulated_mask).sum())
             if "Estado_Validacion" in live_df.columns:
