@@ -281,10 +281,11 @@ elif page == "Datos de Google Sheets":
             all_row_text = live_df.fillna("").astype(str).apply(
                 lambda column: column.map(normalize_test_text)
             ).agg(" ".join, axis=1)
-            compact_row_text = all_row_text.str.replace(r"\s+", "", regex=True)
 
-            # A test ID may be in ID_Evento or shifted to another CSV column.
-            test_id_pattern = r"TEST[-_]*TPM[-_]*\d{3}"
+            # Normalize the entire row to letters/digits. This catches IDs even
+            # if an export changes dash characters, inserts spaces, or splits punctuation.
+            compact_row_text = all_row_text.str.replace(r"[^A-Z0-9]", "", regex=True)
+            test_id_pattern = r"TESTTPM\d{3}"
             row_test_id_mask = compact_row_text.str.contains(
                 test_id_pattern, regex=True, na=False
             )
@@ -295,7 +296,7 @@ elif page == "Datos de Google Sheets":
             )
             if id_column is not None:
                 normalized_ids = live_df[id_column].map(normalize_test_text).str.replace(
-                    r"\s+", "", regex=True
+                    r"[^A-Z0-9]", "", regex=True
                 )
                 id_test_mask = normalized_ids.str.contains(
                     test_id_pattern, regex=True, na=False
@@ -343,7 +344,7 @@ elif page == "Datos de Google Sheets":
                 if id_column is not None:
                     detected_ids = live_df.loc[simulated_mask, id_column].fillna("").astype(str).str.strip().tolist()
                 detected_ids = [value for value in detected_ids if value and value.casefold() not in {"nan", "none", "<na>"}]
-                st.caption("Identificadores de prueba detectados: " + (", ".join(detected_ids) if detected_ids else "se detectaron filas simuladas sin ID legible"))
+                st.caption("IDs de filas clasificadas como prueba: " + (", ".join(detected_ids) if detected_ids else "se detectaron filas simuladas sin ID legible"))
             st.caption("Los registros vivos se mantienen separados del histórico julio 2024–junio 2025. Ningún registro vivo modifica el Pareto ni la disponibilidad histórica.")
             if simulated_count:
                 st.warning(f"Se identificaron {simulated_count} registro(s) de prueba simulada. No deben presentarse como producción real.")
