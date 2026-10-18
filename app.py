@@ -71,8 +71,9 @@ def read_google_sheet():
             raise RuntimeError(
                 "google_sheets_csv_url debe ser la URL CSV publicada o la URL gviz/tq de la pestaña REGISTROS."
             )
-        # The sheet has two descriptive rows before the actual column header.
-        live_df = pd.read_csv(csv_url, skiprows=2, encoding="utf-8-sig", on_bad_lines="warn")
+        # This sheet's export has one title row before the real column header.
+        # Skip exactly one row so the first event (TEST-TPM-001) is not discarded.
+        live_df = pd.read_csv(csv_url, skiprows=1, encoding="utf-8-sig", on_bad_lines="warn")
         live_df.columns = [str(c).replace("\ufeff", "").strip() for c in live_df.columns]
         live_df = live_df.loc[:, ~pd.Index(live_df.columns).astype(str).str.match(r"^Unnamed")]
 
@@ -271,13 +272,17 @@ elif page == "Datos de Google Sheets":
             # Recheck using IDs at display time too, so the KPI and visible table agree.
             id_column = next((c for c in live_df.columns if str(c).strip().casefold() == "id_evento"), None)
             id_simulated_mask = (
-                live_df[id_column].fillna("").astype(str).str.strip().str.upper().str.startswith("TEST-TPM-")
+                live_df[id_column].fillna("").astype(str).str.strip().str.upper().str.contains(r"TEST[-–_ ]?TPM[-–_ ]?", regex=True)
                 if id_column is not None else pd.Series(False, index=live_df.index)
             )
+            # Catch a test ID even if CSV columns were shifted or the ID header differs.
+            any_cell_test_mask = live_df.astype(str).apply(
+                lambda col: col.str.upper().str.contains(r"TEST[-–_ ]?TPM[-–_ ]?", regex=True, na=False)
+            ).any(axis=1)
             row_simulated_mask = live_df.get(
                 "Clasificacion_Sistema", pd.Series("Pendiente de clasificación", index=live_df.index)
             ).eq("Prueba simulada")
-            simulated_mask = id_simulated_mask | row_simulated_mask
+            simulated_mask = id_simulated_mask | any_cell_test_mask | row_simulated_mask
             live_df["Clasificacion_Sistema"] = np.where(simulated_mask, "Prueba simulada", "Pendiente de clasificación")
             simulated_count = int(simulated_mask.sum())
             unclassified_count = int((~simulated_mask).sum())
