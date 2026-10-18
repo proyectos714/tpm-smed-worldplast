@@ -269,48 +269,62 @@ elif page == "Datos de Google Sheets":
         if live_df.empty:
             st.warning("La pestaña existe, pero no contiene registros con ID_Evento.")
         else:
-           # Clasificar pruebas por ID y por el contenido de toda la fila.
+            # Detect simulated test events from every cell, not just one column.
+            # Normalize Unicode dashes and spaces because spreadsheet exports can vary.
+            def normalize_test_text(value):
+                text = "" if pd.isna(value) else str(value)
+                text = text.upper().replace("\u00a0", " ")
+                for dash in ("‐", "‑", "‒", "–", "—", "―", "−"):
+                    text = text.replace(dash, "-")
+                return text
+
+            all_row_text = live_df.fillna("").astype(str).apply(
+                lambda column: column.map(normalize_test_text)
+            ).agg(" ".join, axis=1)
+            compact_row_text = all_row_text.str.replace(r"\s+", "", regex=True)
+
+            # A test ID may be in ID_Evento or shifted to another CSV column.
+            test_id_pattern = r"TEST[-_]*TPM[-_]*\d{3}"
+            row_test_id_mask = compact_row_text.str.contains(
+                test_id_pattern, regex=True, na=False
+            )
+
             id_column = next(
-                (c for c in live_df.columns
-                 if str(c).strip().casefold() == "id_evento"),
-                None
+                (c for c in live_df.columns if str(c).strip().casefold() == "id_evento"),
+                None,
             )
-
-            row_text = (
-                live_df.fillna("")
-                .astype(str)
-                .agg(" ".join, axis=1)
-                .str.upper()
-            )
-
-            # Reconocer IDs como TEST-TPM-001 hasta TEST-TPM-005.
             if id_column is not None:
-                ids = live_df[id_column].fillna("").astype(str).str.strip().str.upper()
-                id_simulated_mask = ids.str.match(
-                    r"^TEST[-–_ ]?TPM[-–_ ]?\d+$",
-                    na=False
+                normalized_ids = live_df[id_column].map(normalize_test_text).str.replace(
+                    r"\s+", "", regex=True
+                )
+                id_test_mask = normalized_ids.str.contains(
+                    test_id_pattern, regex=True, na=False
                 )
             else:
-                id_simulated_mask = pd.Series(False, index=live_df.index)
+                id_test_mask = pd.Series(False, index=live_df.index)
 
-            # Reconocer pruebas incluso si hay diferencias en otros campos.
-            text_simulated_mask = (
-                row_text.str.contains("TEST-TPM-", regex=False, na=False)
-                | row_text.str.contains("PRUEBA SIMULADA", regex=False, na=False)
-                | row_text.str.contains("FICTICIO", regex=False, na=False)
+            # The source/observation can also mark a row as simulated even if its ID is malformed.
+            simulation_note_mask = all_row_text.str.contains(
+                r"PRUEBA\s*SIMULADA|FICTICI|DATOS\s*FICTICIOS|REGISTRO\s*FICTICIO",
+                regex=True,
+                na=False,
             )
+            prior_classification_mask = live_df.get(
+                "Clasificacion_Sistema",
+                pd.Series("", index=live_df.index),
+            ).astype(str).str.strip().str.casefold().eq("prueba simulada")
 
-            simulated_mask = id_simulated_mask | text_simulated_mask
-
+            simulated_mask = (
+                row_test_id_mask
+                | id_test_mask
+                | simulation_note_mask
+                | prior_classification_mask
+            )
             live_df["Clasificacion_Sistema"] = np.where(
-                simulated_mask,
-                "Prueba simulada",
-                "Pendiente de clasificación"
+                simulated_mask, "Prueba simulada", "Pendiente de clasificación"
             )
-
             simulated_count = int(simulated_mask.sum())
             unclassified_count = int((~simulated_mask).sum())
-
             if "Estado_Validacion" in live_df.columns:
                 validation = live_df["Estado_Validacion"].fillna("").astype(str).str.strip().str.casefold()
                 validated_count = int(validation.isin(["validado", "validada", "validado por responsable", "aprobado", "aprobada"]).sum())
@@ -324,6 +338,12 @@ elif page == "Datos de Google Sheets":
             m2.metric("Pruebas simuladas", simulated_count)
             m3.metric("Pendientes de clasificación", unclassified_count)
             m4.metric("Pendientes de validación", pending_count)
+            if simulated_count:
+                detected_ids = []
+                if id_column is not None:
+                    detected_ids = live_df.loc[simulated_mask, id_column].fillna("").astype(str).str.strip().tolist()
+                detected_ids = [value for value in detected_ids if value and value.casefold() not in {"nan", "none", "<na>"}]
+                st.caption("Identificadores de prueba detectados: " + (", ".join(detected_ids) if detected_ids else "se detectaron filas simuladas sin ID legible"))
             st.caption("Los registros vivos se mantienen separados del histórico julio 2024–junio 2025. Ningún registro vivo modifica el Pareto ni la disponibilidad histórica.")
             if simulated_count:
                 st.warning(f"Se identificaron {simulated_count} registro(s) de prueba simulada. No deben presentarse como producción real.")
