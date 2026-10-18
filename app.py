@@ -71,14 +71,38 @@ def read_google_sheet():
             raise RuntimeError(
                 "google_sheets_csv_url debe ser la URL CSV publicada o la URL gviz/tq de la pestaña REGISTROS."
             )
-        # The structured workbook's first row is a title, and the second row has column headers.
-        # The gviz endpoint may return the title line as well, so skip it and decode UTF-8 safely.
-        live_df = pd.read_csv(csv_url, skiprows=1, encoding="utf-8-sig", on_bad_lines="warn")
+        # The sheet has two descriptive rows before the actual column header.
+        live_df = pd.read_csv(csv_url, skiprows=2, encoding="utf-8-sig", on_bad_lines="warn")
         live_df.columns = [str(c).replace("\ufeff", "").strip() for c in live_df.columns]
         live_df = live_df.loc[:, ~pd.Index(live_df.columns).astype(str).str.match(r"^Unnamed")]
+
+        # Normalize text and remove completely empty rows / rows without an event ID.
+        for col in live_df.select_dtypes(include="object").columns:
+            live_df[col] = live_df[col].map(lambda x: x.strip() if isinstance(x, str) else x)
         if "ID_Evento" in live_df.columns:
+            ids = live_df["ID_Evento"].fillna("").astype(str).str.strip()
+            live_df = live_df[ids.ne("") & ids.str.lower().ne("nan")].copy()
             live_df["ID_Evento"] = live_df["ID_Evento"].astype(str).str.strip()
-            live_df = live_df[live_df["ID_Evento"].notna() & (live_df["ID_Evento"] != "") & (live_df["ID_Evento"].str.lower() != "nan")]
+
+        # Classify simulations explicitly; do not use live rows to alter historical KPIs.
+        def is_simulated(row):
+            event_id = str(row.get("ID_Evento", "")).strip().upper()
+            source = str(row.get("Fuente_Registro", "")).strip().upper()
+            notes = str(row.get("Observaciones", "")).strip().upper()
+            description = str(row.get("Descripcion", "")).strip().upper()
+            return (
+                event_id.startswith("TEST-")
+                or "PRUEBA SIMULADA" in source
+                or "FICTICIO" in notes
+                or "SIMULAD" in notes
+                or "SIMULAD" in description
+            )
+
+        if not live_df.empty:
+            live_df["Clasificacion_Sistema"] = live_df.apply(
+                lambda row: "Prueba simulada" if is_simulated(row) else "Registro operacional",
+                axis=1,
+            )
         return live_df.reset_index(drop=True), WORKSHEET_NAME
 
     # Optional fallback for deployments that can use a service account.
@@ -228,11 +252,33 @@ elif page == "Datos de Google Sheets":
     try:
         with st.spinner("Conectando con Google Sheets..."):
             live_df, tab_name = read_google_sheet()
-        st.success(f"Conexión correcta · pestaña: {tab_name} · registros leídos: {len(live_df)}")
+        st.success(f"Conexión correcta · pestaña: {tab_name} · registros con ID: {len(live_df)}")
         if live_df.empty:
-            st.warning("La pestaña existe, pero no contiene registros de datos.")
+            st.warning("La pestaña existe, pero no contiene registros con ID_Evento.")
         else:
-            st.caption("Estos son registros vivos de Google Sheets y no se suman automáticamente al histórico julio 2024–junio 2025.")
+            simulated_mask = live_df.get(
+                "Clasificacion_Sistema", pd.Series("Registro operacional", index=live_df.index)
+            ).eq("Prueba simulada")
+            simulated_count = int(simulated_mask.sum())
+            operational_count = int((~simulated_mask).sum())
+            if "Estado_Validacion" in live_df.columns:
+                validation = live_df["Estado_Validacion"].fillna("").astype(str).str.strip().str.lower()
+                validated_count = int(validation.isin(["validado", "validada", "validado por responsable", "aprobado", "aprobada"]).sum())
+                pending_count = int(validation.isin(["pendiente", "", "nan", "por validar", "no validado"]).sum())
+            else:
+                validated_count = 0
+                pending_count = len(live_df)
+
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Registros con ID", len(live_df))
+            m2.metric("Pruebas simuladas", simulated_count)
+            m3.metric("Registros operacionales", operational_count)
+            m4.metric("Pendientes de validación", pending_count)
+            st.caption("Los registros vivos se mantienen separados del histórico julio 2024–junio 2025. Las pruebas simuladas se identifican y no se incorporan al Pareto ni a la disponibilidad histórica.")
+            if simulated_count:
+                st.warning(f"Se identificaron {simulated_count} registro(s) de prueba simulada. No deben presentarse como producción real.")
+            if pending_count:
+                st.info(f"Hay {pending_count} registro(s) pendientes o sin estado de validación. Revísalos antes de utilizarlos como evidencia operacional.")
             st.dataframe(live_df, use_container_width=True, hide_index=True)
             st.download_button(
                 "Descargar registros visibles como CSV",
