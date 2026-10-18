@@ -60,11 +60,21 @@ WORKSHEET_NAME = "REGISTROS"
 
 @st.cache_data(ttl=300, show_spinner=False)
 def read_google_sheet():
-    """Read-only connection to the configured Google Sheet."""
+    """Read REGISTROS from a published CSV URL or, alternatively, service-account credentials."""
+    # Fast path for this deployment: published CSV avoids service-account JSON keys.
+    csv_url = st.secrets.get("google_sheets_csv_url", "")
+    if csv_url:
+        if not str(csv_url).startswith("https://docs.google.com/spreadsheets/d/e/") or "output=csv" not in str(csv_url):
+            raise RuntimeError(
+                "El secreto google_sheets_csv_url debe ser el enlace CSV publicado de la pestaña REGISTROS."
+            )
+        live_df = pd.read_csv(csv_url)
+        return live_df, WORKSHEET_NAME
+
+    # Optional fallback for deployments that can use a service account.
     if "gcp_service_account" not in st.secrets:
         raise RuntimeError(
-            "Falta configurar gcp_service_account en Streamlit Secrets. "
-            "Sigue el apartado de conexión a Google Sheets del README."
+            "Configura google_sheets_csv_url en Streamlit Secrets con el enlace CSV publicado de REGISTROS."
         )
     info = dict(st.secrets["gcp_service_account"])
     scopes = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
