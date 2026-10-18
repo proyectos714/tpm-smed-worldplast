@@ -1,9 +1,11 @@
-import json
+mport json
 import pandas as pd
 import numpy as np
 import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
+import gspread
+from google.oauth2.service_account import Credentials
 
 st.set_page_config(
     page_title="TPM-SMED | World Plast",
@@ -58,20 +60,32 @@ WORKSHEET_NAME = "REGISTROS"
 
 @st.cache_data(ttl=300, show_spinner=False)
 def read_google_sheet():
-    """Read-only access to the published CSV URL configured in Streamlit Secrets."""
+    """Read REGISTROS from a published CSV URL or, alternatively, service-account credentials."""
+    # Fast path for this deployment: published CSV avoids service-account JSON keys.
     csv_url = st.secrets.get("google_sheets_csv_url", "")
-    if csv_url and str(csv_url).startswith("https://"):
-        df = pd.read_csv(csv_url)
-        return df, WORKSHEET_NAME
+    if csv_url:
+        csv_url = str(csv_url).strip()
+        is_published_csv = csv_url.startswith("https://docs.google.com/spreadsheets/d/e/") and "output=csv" in csv_url
+        is_gviz_csv = csv_url.startswith("https://docs.google.com/spreadsheets/d/") and "/gviz/tq" in csv_url and "tqx=out:csv" in csv_url
+        if not (is_published_csv or is_gviz_csv):
+            raise RuntimeError(
+                "google_sheets_csv_url debe ser la URL CSV publicada o la URL gviz/tq de la pestaña REGISTROS."
+            )
+        # The structured workbook's first row is a title, and the second row has column headers.
+        # The gviz endpoint may return the title line as well, so skip it and decode UTF-8 safely.
+        live_df = pd.read_csv(csv_url, skiprows=1, encoding="utf-8-sig", on_bad_lines="warn")
+        live_df.columns = [str(c).replace("\ufeff", "").strip() for c in live_df.columns]
+        live_df = live_df.loc[:, ~pd.Index(live_df.columns).astype(str).str.match(r"^Unnamed")]
+        if "ID_Evento" in live_df.columns:
+            live_df["ID_Evento"] = live_df["ID_Evento"].astype(str).str.strip()
+            live_df = live_df[live_df["ID_Evento"].notna() & (live_df["ID_Evento"] != "") & (live_df["ID_Evento"].str.lower() != "nan")]
+        return live_df.reset_index(drop=True), WORKSHEET_NAME
 
-    # Legacy fallback if the CSV URL has not been configured.
+    # Optional fallback for deployments that can use a service account.
     if "gcp_service_account" not in st.secrets:
         raise RuntimeError(
-            "Falta configurar google_sheets_csv_url en Streamlit Secrets. "
-            "Pega la URL CSV publicada de la pestaña REGISTROS."
+            "Configura google_sheets_csv_url en Streamlit Secrets con el enlace CSV publicado de REGISTROS."
         )
-    import gspread
-    from google.oauth2.service_account import Credentials
     info = dict(st.secrets["gcp_service_account"])
     scopes = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
     credentials = Credentials.from_service_account_info(info, scopes=scopes)
@@ -228,11 +242,11 @@ elif page == "Datos de Google Sheets":
             )
     except Exception as e:
         st.error("No se pudo conectar a Google Sheets.")
-        st.write("Verifica que `google_sheets_csv_url` contenga la URL CSV publicada y que sea accesible.")
+        st.write("Revisa los pasos de configuración segura incluidos en el README.")
         st.code(str(e))
         st.info(
-            "No compartas aquí claves privadas ni pegues credenciales en el código. "
-            "La conexión CSV publicada no requiere cuenta de servicio ni clave JSON."
+            "La conexión CSV publicada no requiere cuenta de servicio ni clave JSON. "
+            "Verifica que google_sheets_csv_url sea exactamente la URL probada y que la pestaña sea accesible públicamente."
         )
 
 elif page == "Metodología y límites":
