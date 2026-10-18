@@ -76,31 +76,36 @@ def read_google_sheet():
         live_df.columns = [str(c).replace("\ufeff", "").strip() for c in live_df.columns]
         live_df = live_df.loc[:, ~pd.Index(live_df.columns).astype(str).str.match(r"^Unnamed")]
 
-        # Normalize text and remove completely empty rows / rows without an event ID.
+        # Normalize headers, text, and empty values before counting records.
+        live_df.columns = [str(c).replace("\ufeff", "").strip() for c in live_df.columns]
         for col in live_df.select_dtypes(include="object").columns:
             live_df[col] = live_df[col].map(lambda x: x.strip() if isinstance(x, str) else x)
-        if "ID_Evento" in live_df.columns:
-            ids = live_df["ID_Evento"].fillna("").astype(str).str.strip()
-            live_df = live_df[ids.ne("") & ids.str.lower().ne("nan")].copy()
-            live_df["ID_Evento"] = live_df["ID_Evento"].astype(str).str.strip()
+            live_df[col] = live_df[col].replace({"": pd.NA, "None": pd.NA, "none": pd.NA, "NULL": pd.NA, "null": pd.NA, "nan": pd.NA, "NaN": pd.NA})
 
-        # Classify simulations explicitly; do not use live rows to alter historical KPIs.
+        # Remove fully empty rows, including rows that only contain spreadsheet placeholders.
+        live_df = live_df.dropna(how="all").copy()
+
+        # Identify the event-ID column despite accidental spaces/case differences.
+        id_col = next((c for c in live_df.columns if str(c).strip().casefold() == "id_evento"), None)
+        if id_col is not None:
+            ids = live_df[id_col].fillna("").astype(str).str.strip()
+            valid_id = ids.ne("") & ~ids.str.casefold().isin(["nan", "none", "null", "<na>"])
+            live_df = live_df[valid_id].copy()
+            live_df[id_col] = live_df[id_col].fillna("").astype(str).str.strip()
+
+        # Classify simulations using the whole row, so a shifted/missing column does not hide a test.
         def is_simulated(row):
-            event_id = str(row.get("ID_Evento", "")).strip().upper()
-            source = str(row.get("Fuente_Registro", "")).strip().upper()
-            notes = str(row.get("Observaciones", "")).strip().upper()
-            description = str(row.get("Descripcion", "")).strip().upper()
+            values = " ".join(str(v) for v in row.tolist() if pd.notna(v)).upper()
             return (
-                event_id.startswith("TEST-")
-                or "PRUEBA SIMULADA" in source
-                or "FICTICIO" in notes
-                or "SIMULAD" in notes
-                or "SIMULAD" in description
+                "TEST-TPM-" in values
+                or "PRUEBA SIMULADA" in values
+                or "FICTICIO" in values
+                or "SIMULAD" in values
             )
 
         if not live_df.empty:
             live_df["Clasificacion_Sistema"] = live_df.apply(
-                lambda row: "Prueba simulada" if is_simulated(row) else "Registro operacional",
+                lambda row: "Prueba simulada" if is_simulated(row) else "Pendiente de clasificación",
                 axis=1,
             )
         return live_df.reset_index(drop=True), WORKSHEET_NAME
@@ -257,14 +262,14 @@ elif page == "Datos de Google Sheets":
             st.warning("La pestaña existe, pero no contiene registros con ID_Evento.")
         else:
             simulated_mask = live_df.get(
-                "Clasificacion_Sistema", pd.Series("Registro operacional", index=live_df.index)
+                "Clasificacion_Sistema", pd.Series("Pendiente de clasificación", index=live_df.index)
             ).eq("Prueba simulada")
             simulated_count = int(simulated_mask.sum())
-            operational_count = int((~simulated_mask).sum())
+            unclassified_count = int((~simulated_mask).sum())
             if "Estado_Validacion" in live_df.columns:
-                validation = live_df["Estado_Validacion"].fillna("").astype(str).str.strip().str.lower()
+                validation = live_df["Estado_Validacion"].fillna("").astype(str).str.strip().str.casefold()
                 validated_count = int(validation.isin(["validado", "validada", "validado por responsable", "aprobado", "aprobada"]).sum())
-                pending_count = int(validation.isin(["pendiente", "", "nan", "por validar", "no validado"]).sum())
+                pending_count = len(live_df) - validated_count
             else:
                 validated_count = 0
                 pending_count = len(live_df)
@@ -272,14 +277,18 @@ elif page == "Datos de Google Sheets":
             m1, m2, m3, m4 = st.columns(4)
             m1.metric("Registros con ID", len(live_df))
             m2.metric("Pruebas simuladas", simulated_count)
-            m3.metric("Registros operacionales", operational_count)
+            m3.metric("Pendientes de clasificación", unclassified_count)
             m4.metric("Pendientes de validación", pending_count)
-            st.caption("Los registros vivos se mantienen separados del histórico julio 2024–junio 2025. Las pruebas simuladas se identifican y no se incorporan al Pareto ni a la disponibilidad histórica.")
+            st.caption("Los registros vivos se mantienen separados del histórico julio 2024–junio 2025. Ningún registro vivo modifica el Pareto ni la disponibilidad histórica.")
             if simulated_count:
                 st.warning(f"Se identificaron {simulated_count} registro(s) de prueba simulada. No deben presentarse como producción real.")
+            if unclassified_count:
+                st.info(f"Hay {unclassified_count} registro(s) que no se han identificado como prueba; no se consideran confirmados como operacionales hasta revisarlos.")
             if pending_count:
                 st.info(f"Hay {pending_count} registro(s) pendientes o sin estado de validación. Revísalos antes de utilizarlos como evidencia operacional.")
-            st.dataframe(live_df, use_container_width=True, hide_index=True)
+            display_df = live_df.copy()
+            display_df = display_df.astype(object).where(pd.notna(display_df), "")
+            st.dataframe(display_df, use_container_width=True, hide_index=True)
             st.download_button(
                 "Descargar registros visibles como CSV",
                 data=live_df.to_csv(index=False).encode("utf-8-sig"),
