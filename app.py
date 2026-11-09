@@ -1,5 +1,6 @@
 import pandas as pd
 import numpy as np
+import re
 import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
@@ -395,51 +396,173 @@ elif page == "Datos de Google Sheets":
 
 elif page == "Prueba de dataset":
     st.markdown("### Prueba funcional con dataset independiente")
-    st.caption("Carga un CSV o Excel con registros de prueba. Esta sección no modifica la base histórica ni Google Sheets.")
-    uploaded = st.file_uploader("Selecciona un dataset sintético (.csv o .xlsx)", type=["csv", "xlsx"])
+    st.caption(
+        "Carga archivos CSV o Excel. El sistema identifica si el conjunto corresponde a "
+        "una prueba sintética o a registros históricos y conserva esa procedencia."
+    )
+    uploaded = st.file_uploader(
+        "Selecciona un dataset (.csv o .xlsx)",
+        type=["csv", "xlsx"],
+        help="Se aceptan los encabezados de la plantilla de prueba y los de la hoja histórica R_Tiempos_motivos."
+    )
+
+    def _norm_col(value):
+        import unicodedata
+        value = unicodedata.normalize("NFKD", str(value))
+        value = "".join(ch for ch in value if not unicodedata.combining(ch))
+        return re.sub(r"[^a-z0-9]+", "", value.casefold())
+
+    def _find_col(frame, candidates):
+        lookup = {_norm_col(c): c for c in frame.columns}
+        for candidate in candidates:
+            found = lookup.get(_norm_col(candidate))
+            if found is not None:
+                return found
+        return None
+
     if uploaded is not None:
         try:
-            test_df = pd.read_csv(uploaded) if uploaded.name.lower().endswith(".csv") else pd.read_excel(uploaded)
-            test_df.columns = [str(c).replace("\ufeff", "").strip() for c in test_df.columns]
-            required = ["ID_Evento", "Tipo_Evento", "Categoria_Perdida", "Tiempo_Parada_Min"]
-            missing = [c for c in required if c not in test_df.columns]
-            if missing:
-                st.error("Faltan columnas necesarias para esta prueba: " + ", ".join(missing))
+            if uploaded.name.lower().endswith(".csv"):
+                raw_df = pd.read_csv(uploaded, encoding="utf-8-sig")
             else:
-                test_df["Tiempo_Parada_Min"] = pd.to_numeric(test_df["Tiempo_Parada_Min"], errors="coerce")
-                valid_time = test_df["Tiempo_Parada_Min"].notna() & (test_df["Tiempo_Parada_Min"] >= 0)
-                ids = test_df["ID_Evento"].fillna("").astype(str).str.strip()
-                unique_ids = ids.ne("") & ~ids.duplicated(keep=False)
-                simulated = pd.Series(False, index=test_df.index)
-                for col in ["Fuente_Registro", "Descripcion", "Observaciones", "ID_Evento"]:
-                    if col in test_df.columns:
-                        simulated |= test_df[col].fillna("").astype(str).str.contains(r"SIM|SINTÉTIC|SINTETIC|FICTICI", case=False, regex=True)
+                raw_df = pd.read_excel(uploaded, engine="openpyxl")
+            raw_df.columns = [str(c).replace("\ufeff", "").strip() for c in raw_df.columns]
+            raw_df = raw_df.dropna(how="all").copy()
+
+            # Map either the synthetic test schema or the user's actual historical schema.
+            id_col = _find_col(raw_df, ["ID_Evento", "ID", "N° Falla"])
+            type_col = _find_col(raw_df, ["Tipo_Evento", "Tipo de evento"])
+            category_col = _find_col(raw_df, [
+                "Categoria_Perdida", "Motivos detectados", "Motivos_detectados",
+                "Categoría de pérdida", "Categoria de perdida"
+            ])
+            time_col = _find_col(raw_df, [
+                "Tiempo_Parada_Min", "Tiempor improductivo (Minutos)",
+                "Tiempo improductivo (Minutos)", "Tiempo_improductivo_min", "Duracion_min"
+            ])
+            date_col = _find_col(raw_df, ["Fecha"])
+            cause_col = _find_col(raw_df, ["Causas identificadas", "Causas_identificadas"])
+            root_col = _find_col(raw_df, ["Causas raíces categorizadas", "Causas_raices_categorizadas"])
+            source_col = _find_col(raw_df, ["Fuente_Registro", "Origen_dato", "Fuente"])
+
+            missing = []
+            if category_col is None: missing.append("Categoría de pérdida / Motivos detectados")
+            if time_col is None: missing.append("Tiempo de parada / Tiempo improductivo")
+            if missing:
+                st.error("No se encontraron los campos necesarios: " + "; ".join(missing))
+                st.caption("Se requieren una categoría de pérdida y un tiempo numérico. Los nombres pueden variar; el sistema reconoce equivalencias.")
+            else:
+                data = raw_df.copy()
+                data["ID_Evento_Sistema"] = (
+                    data[id_col].astype("string").str.strip()
+                    if id_col is not None
+                    else pd.Series([f"ROW-{i+1:03d}" for i in range(len(data))], index=data.index, dtype="string")
+                )
+                # Source type is determined from explicit metadata/name, never by assuming historical rows are synthetic.
+                source_text = uploaded.name.casefold()
+                if "sintetico" in source_text or "sintético" in source_text:
+                    provenance = "Dataset sintético"
+                elif "historico" in source_text or "histórico" in source_text or "julio_2024" in source_text:
+                    provenance = "Dataset histórico piloto"
+                elif source_col is not None and data[source_col].fillna("").astype(str).str.contains(
+                    r"histor|real", case=False, regex=True
+                ).any():
+                    provenance = "Dataset histórico"
+                elif source_col is not None and data[source_col].fillna("").astype(str).str.contains(
+                    r"sint[eé]tic|fictici|simulad", case=False, regex=True
+                ).any():
+                    provenance = "Dataset sintético"
+                else:
+                    provenance = "Procedencia pendiente de confirmar"
+
+                data["Categoria_Perdida_Sistema"] = data[category_col].fillna("Sin categoría").astype(str).str.strip()
+                data["Tiempo_Parada_Min_Sistema"] = pd.to_numeric(data[time_col], errors="coerce")
+                if type_col is not None:
+                    data["Tipo_Evento_Sistema"] = data[type_col].fillna("Evento de pérdida").astype(str)
+                else:
+                    data["Tipo_Evento_Sistema"] = "Evento de pérdida"
+                if date_col is not None:
+                    data["Fecha_Sistema"] = pd.to_datetime(data[date_col], errors="coerce", dayfirst=True)
+
+                valid_time = data["Tiempo_Parada_Min_Sistema"].notna() & (data["Tiempo_Parada_Min_Sistema"] >= 0)
+                valid_category = data["Categoria_Perdida_Sistema"].ne("") & data["Categoria_Perdida_Sistema"].ne("Sin categoría")
+                id_series = data["ID_Evento_Sistema"].fillna("").astype(str).str.strip()
+                valid_ids = id_series.ne("") & ~id_series.duplicated(keep=False)
+
                 k1, k2, k3, k4 = st.columns(4)
-                k1.metric("Filas recibidas", len(test_df))
-                k2.metric("IDs únicos", int(unique_ids.sum()))
+                k1.metric("Registros recibidos", len(data))
+                k2.metric("IDs no duplicados", int(valid_ids.sum()))
                 k3.metric("Tiempos válidos", int(valid_time.sum()))
-                k4.metric("Filas identificadas como sintéticas", int(simulated.sum()))
-                if not simulated.all():
-                    st.warning("Hay filas que no están identificadas explícitamente como sintéticas. Revisa su procedencia antes de presentar esta prueba.")
-                if not unique_ids.all():
-                    st.error("Se detectaron IDs vacíos o duplicados.")
+                k4.metric("Tiempo improductivo", f"{data.loc[valid_time, 'Tiempo_Parada_Min_Sistema'].sum():,.2f} min")
+
+                st.info(f"Procedencia identificada: **{provenance}**. Esta carga es independiente de Google Sheets y no modifica la base histórica.")
                 if not valid_time.all():
-                    st.error("Hay tiempos de parada vacíos, no numéricos o negativos.")
-                if unique_ids.all() and valid_time.all() and simulated.all():
-                    st.success("Controles básicos superados. El dataset está identificado como sintético, tiene IDs únicos y tiempos de parada válidos.")
-                summary = (test_df.loc[valid_time].groupby("Categoria_Perdida", dropna=False)
-                           .agg(Eventos=("ID_Evento", "count"), Tiempo_Parada_Min=("Tiempo_Parada_Min", "sum"))
-                           .reset_index().sort_values("Tiempo_Parada_Min", ascending=False))
+                    st.error(f"{int((~valid_time).sum())} registro(s) tienen tiempos vacíos, no numéricos o negativos.")
+                if not valid_category.all():
+                    st.warning(f"{int((~valid_category).sum())} registro(s) no tienen categoría de pérdida reconocible.")
+                if not valid_ids.all():
+                    st.warning("Hay identificadores vacíos o repetidos. Se muestran los registros, pero deben revisarse antes de validar la prueba.")
+                if valid_time.all() and valid_category.all() and valid_ids.all():
+                    st.success("Validación estructural superada: identificadores, categorías y tiempos son utilizables para el análisis de pérdidas.")
+
+                valid_data = data.loc[valid_time & valid_category].copy()
+                summary = (
+                    valid_data.groupby("Categoria_Perdida_Sistema", dropna=False)
+                    .agg(
+                        Eventos=("ID_Evento_Sistema", "count"),
+                        Tiempo_Parada_Min=("Tiempo_Parada_Min_Sistema", "sum")
+                    )
+                    .reset_index()
+                    .sort_values("Tiempo_Parada_Min", ascending=False)
+                )
                 if not summary.empty:
-                    summary["Participacion_%"] = summary["Tiempo_Parada_Min"] / summary["Tiempo_Parada_Min"].sum() * 100
-                    st.markdown("#### Priorización por categoría")
+                    total = summary["Tiempo_Parada_Min"].sum()
+                    summary["Participacion_%"] = np.where(total > 0, summary["Tiempo_Parada_Min"] / total * 100, 0)
+                    summary["Acumulado_%"] = summary["Participacion_%"].cumsum()
+                    st.markdown("#### Priorización de pérdidas del archivo cargado")
                     st.dataframe(summary.round(2), use_container_width=True, hide_index=True)
-                    chart = px.bar(summary, x="Categoria_Perdida", y="Tiempo_Parada_Min", text="Tiempo_Parada_Min", title="Tiempo de parada por categoría (dataset cargado)")
-                    st.plotly_chart(chart, use_container_width=True)
-                st.markdown("#### Registros utilizados")
-                st.dataframe(test_df, use_container_width=True, hide_index=True)
+                    left, right = st.columns(2)
+                    with left:
+                        fig = px.bar(
+                            summary.sort_values("Tiempo_Parada_Min"),
+                            x="Tiempo_Parada_Min", y="Categoria_Perdida_Sistema",
+                            orientation="h", text="Tiempo_Parada_Min",
+                            title="Tiempo improductivo por categoría"
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
+                    with right:
+                        fig = go.Figure()
+                        fig.add_trace(go.Bar(x=summary["Categoria_Perdida_Sistema"], y=summary["Tiempo_Parada_Min"], name="Minutos"))
+                        fig.add_trace(go.Scatter(x=summary["Categoria_Perdida_Sistema"], y=summary["Acumulado_%"], name="Acumulado (%)", yaxis="y2", mode="lines+markers"))
+                        fig.add_hline(y=80, line_dash="dot", yref="y2")
+                        fig.update_layout(
+                            title="Pareto del archivo cargado",
+                            yaxis=dict(title="Minutos"),
+                            yaxis2=dict(title="Acumulado (%)", overlaying="y", side="right", range=[0, 110]),
+                            margin=dict(l=10, r=10, t=55, b=10)
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
+
+                st.markdown("#### Registros reconocidos")
+                display_cols = ["ID_Evento_Sistema"]
+                if date_col is not None: display_cols.append(date_col)
+                display_cols += ["Tipo_Evento_Sistema", "Categoria_Perdida_Sistema", "Tiempo_Parada_Min_Sistema"]
+                for optional_col in [cause_col, root_col]:
+                    if optional_col is not None and optional_col not in display_cols:
+                        display_cols.append(optional_col)
+                st.dataframe(data[display_cols], use_container_width=True, hide_index=True)
+                st.download_button(
+                    "Descargar datos normalizados",
+                    data=data.to_csv(index=False).encode("utf-8-sig"),
+                    file_name="dataset_tpm_smed_normalizado.csv",
+                    mime="text/csv"
+                )
+        except ImportError as exc:
+            st.error("Falta una dependencia para leer este formato.")
+            st.code(str(exc))
+            st.info("Instala las dependencias incluidas en requirements.txt y vuelve a ejecutar la aplicación.")
         except Exception as exc:
-            st.error("No se pudo procesar el archivo. Verifica que sea un CSV o Excel válido.")
+            st.error("No se pudo procesar el archivo. Revisa el formato y los encabezados.")
             st.code(str(exc))
 
 elif page == "Metodología y límites":
