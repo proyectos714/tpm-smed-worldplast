@@ -1,4 +1,3 @@
-import json
 import pandas as pd
 import numpy as np
 import streamlit as st
@@ -36,14 +35,16 @@ HISTORICAL = {
         "2024-11", "2024-12", "2025-01", "2025-02",
         "2025-03", "2025-04", "2025-05", "2025-06"
     ],
-    "availability": [
+    "monthly_availability": [
         89.7484, 91.0251, 90.6858, 87.8194,
         81.7238, 77.5642, 84.6554, 89.0523,
         85.2737, 87.8686, 88.3579, 84.5340
     ],
 }
 HISTORICAL["operating_min"] = HISTORICAL["programmed_min"] - HISTORICAL["downtime_min"]
-HISTORICAL["availability"] = HISTORICAL["operating_min"] / HISTORICAL["programmed_min"] * 100
+HISTORICAL["global_availability"] = (
+    HISTORICAL["operating_min"] / HISTORICAL["programmed_min"] * 100
+)
 
 MOTIVES = pd.DataFrame([
     {"Motivo": "Falta_Mantenimiento", "Eventos": 128, "Minutos": 10423.34, "Acción": "TPM"},
@@ -71,9 +72,9 @@ def read_google_sheet():
             raise RuntimeError(
                 "google_sheets_csv_url debe ser la URL CSV publicada o la URL gviz/tq de la pestaña REGISTROS."
             )
-        # This sheet's export has one title row before the real column header.
-        # Skip exactly one row so the first event (TEST-TPM-001) is not discarded.
-        live_df = pd.read_csv(csv_url, skiprows=1, encoding="utf-8-sig", on_bad_lines="warn")
+        # REGISTROS contains three introductory rows (title, note and blank row).
+        # The fourth row contains the actual field names.
+        live_df = pd.read_csv(csv_url, skiprows=3, encoding="utf-8-sig", on_bad_lines="warn")
         live_df.columns = [str(c).replace("\ufeff", "").strip() for c in live_df.columns]
         live_df = live_df.loc[:, ~pd.Index(live_df.columns).astype(str).str.match(r"^Unnamed")]
 
@@ -130,8 +131,14 @@ def read_google_sheet():
     spreadsheet_id = st.secrets.get("google_sheet_id", SHEET_ID)
     worksheet_name = st.secrets.get("google_worksheet", WORKSHEET_NAME)
     worksheet = client.open_by_key(spreadsheet_id).worksheet(worksheet_name)
-    records = worksheet.get_all_records()
-    return pd.DataFrame(records), worksheet.title
+    values = worksheet.get_all_values()
+    if len(values) < 4:
+        return pd.DataFrame(), worksheet.title
+    headers = [str(value).replace("\ufeff", "").strip() for value in values[3]]
+    records = values[4:]
+    frame = pd.DataFrame(records, columns=headers)
+    frame = frame.loc[:, [c for c in frame.columns if c and not str(c).startswith("Unnamed")]]
+    return frame, worksheet.title
 
 def fmt_num(value, decimals=2):
     return f"{value:,.{decimals}f}"
@@ -152,7 +159,7 @@ with st.sidebar:
     st.header("Navegación")
     page = st.radio(
         "Selecciona una sección",
-        ["Resumen ejecutivo", "Pérdidas TPM–SMED", "Simulador TO-BE", "Datos de Google Sheets", "Metodología y límites"],
+        ["Resumen ejecutivo", "Pérdidas TPM–SMED", "Simulador TO-BE", "Datos de Google Sheets", "Prueba de dataset", "Metodología y límites"],
     )
     st.divider()
     st.caption(f"Base histórica: {HISTORICAL['period']}")
@@ -161,18 +168,18 @@ with st.sidebar:
 if page == "Resumen ejecutivo":
     st.markdown("### Indicadores históricos AS-IS")
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Disponibilidad global", f"{HISTORICAL['availability']:.2f}%")
+    c1.metric("Disponibilidad global", f"{HISTORICAL['global_availability']:.2f}%")
     c2.metric("Tiempo improductivo", f"{HISTORICAL['downtime_min']:,.2f} min")
     c3.metric("Eventos de mantenimiento", f"{HISTORICAL['maintenance_events']}")
     c4.metric("Eventos de setup", f"{HISTORICAL['setup_events']}")
 
     left, right = st.columns([1.3, 1])
     with left:
-        hist = pd.DataFrame({"Mes": HISTORICAL["months"], "Disponibilidad (%)": HISTORICAL["availability"]})
+        hist = pd.DataFrame({"Mes": HISTORICAL["months"], "Disponibilidad (%)": HISTORICAL["monthly_availability"]})
         fig = px.line(hist, x="Mes", y="Disponibilidad (%)", markers=True,
                       title="Disponibilidad mensual histórica")
-        fig.add_hline(y=HISTORICAL["availability"], line_dash="dash",
-                      annotation_text=f"Global ponderada: {HISTORICAL['availability']:.2f}%")
+        fig.add_hline(y=HISTORICAL["global_availability"], line_dash="dash",
+                      annotation_text=f"Global ponderada: {HISTORICAL['global_availability']:.2f}%")
         fig.update_layout(yaxis_range=[70, 100], margin=dict(l=10, r=10, t=55, b=10))
         st.plotly_chart(fig, use_container_width=True)
     with right:
@@ -233,7 +240,7 @@ elif page == "Simulador TO-BE":
     recovered_total = recovered_tpm + recovered_smed
     downtime_tobe = HISTORICAL["downtime_min"] - recovered_total
     availability_tobe = (HISTORICAL["programmed_min"] - downtime_tobe) / HISTORICAL["programmed_min"] * 100
-    improvement = availability_tobe - HISTORICAL["availability"]
+    improvement = availability_tobe - HISTORICAL["global_availability"]
 
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Disponibilidad TO-BE", f"{availability_tobe:.2f}%", f"{improvement:+.2f} pp")
@@ -243,7 +250,7 @@ elif page == "Simulador TO-BE":
 
     comp = pd.DataFrame({
         "Escenario": ["AS-IS", "TO-BE"],
-        "Disponibilidad (%)": [HISTORICAL["availability"], availability_tobe],
+        "Disponibilidad (%)": [HISTORICAL["global_availability"], availability_tobe],
         "Tiempo improductivo (min)": [HISTORICAL["downtime_min"], downtime_tobe],
     })
     fig = px.bar(comp, x="Escenario", y="Disponibilidad (%)", color="Escenario",
@@ -334,6 +341,16 @@ elif page == "Datos de Google Sheets":
                 validated_count = 0
                 pending_count = len(live_df)
 
+            # Basic structural checks: these do not certify the truth of a record.
+            duplicate_ids = 0
+            if id_column is not None:
+                ids_for_check = live_df[id_column].fillna("").astype(str).str.strip()
+                duplicate_ids = int(ids_for_check.duplicated(keep=False).sum())
+            required_fields = ["ID_Evento", "Fecha", "Tipo_Evento", "Fuente_Registro"]
+            existing_required = [c for c in required_fields if c in live_df.columns]
+            incomplete_rows = 0
+            if existing_required:
+                incomplete_rows = int(live_df[existing_required].isna().any(axis=1).sum())
             m1, m2, m3, m4 = st.columns(4)
             m1.metric("Registros con ID", len(live_df))
             m2.metric("Pruebas simuladas", simulated_count)
@@ -352,6 +369,12 @@ elif page == "Datos de Google Sheets":
                 st.info(f"Hay {unclassified_count} registro(s) que no se han identificado como prueba; no se consideran confirmados como operacionales hasta revisarlos.")
             if pending_count:
                 st.info(f"Hay {pending_count} registro(s) pendientes o sin estado de validación. Revísalos antes de utilizarlos como evidencia operacional.")
+            if duplicate_ids:
+                st.error(f"Control de calidad: {duplicate_ids} fila(s) presentan identificadores duplicados.")
+            if incomplete_rows:
+                st.warning(f"Control de calidad: {incomplete_rows} fila(s) tienen campos básicos incompletos ({', '.join(existing_required)}).")
+            if not duplicate_ids and not incomplete_rows:
+                st.success("Controles estructurales básicos superados: no se detectaron IDs duplicados ni faltantes en los campos básicos disponibles. Esto no sustituye la verificación documental.")
             display_df = live_df.copy()
             display_df = display_df.astype(object).where(pd.notna(display_df), "")
             st.dataframe(display_df, use_container_width=True, hide_index=True)
@@ -370,12 +393,61 @@ elif page == "Datos de Google Sheets":
             "Verifica que google_sheets_csv_url sea exactamente la URL probada y que la pestaña sea accesible públicamente."
         )
 
+elif page == "Prueba de dataset":
+    st.markdown("### Prueba funcional con dataset independiente")
+    st.caption("Carga un CSV o Excel con registros de prueba. Esta sección no modifica la base histórica ni Google Sheets.")
+    uploaded = st.file_uploader("Selecciona un dataset sintético (.csv o .xlsx)", type=["csv", "xlsx"])
+    if uploaded is not None:
+        try:
+            test_df = pd.read_csv(uploaded) if uploaded.name.lower().endswith(".csv") else pd.read_excel(uploaded)
+            test_df.columns = [str(c).replace("\ufeff", "").strip() for c in test_df.columns]
+            required = ["ID_Evento", "Tipo_Evento", "Categoria_Perdida", "Tiempo_Parada_Min"]
+            missing = [c for c in required if c not in test_df.columns]
+            if missing:
+                st.error("Faltan columnas necesarias para esta prueba: " + ", ".join(missing))
+            else:
+                test_df["Tiempo_Parada_Min"] = pd.to_numeric(test_df["Tiempo_Parada_Min"], errors="coerce")
+                valid_time = test_df["Tiempo_Parada_Min"].notna() & (test_df["Tiempo_Parada_Min"] >= 0)
+                ids = test_df["ID_Evento"].fillna("").astype(str).str.strip()
+                unique_ids = ids.ne("") & ~ids.duplicated(keep=False)
+                simulated = pd.Series(False, index=test_df.index)
+                for col in ["Fuente_Registro", "Descripcion", "Observaciones", "ID_Evento"]:
+                    if col in test_df.columns:
+                        simulated |= test_df[col].fillna("").astype(str).str.contains(r"SIM|SINTÉTIC|SINTETIC|FICTICI", case=False, regex=True)
+                k1, k2, k3, k4 = st.columns(4)
+                k1.metric("Filas recibidas", len(test_df))
+                k2.metric("IDs únicos", int(unique_ids.sum()))
+                k3.metric("Tiempos válidos", int(valid_time.sum()))
+                k4.metric("Filas identificadas como sintéticas", int(simulated.sum()))
+                if not simulated.all():
+                    st.warning("Hay filas que no están identificadas explícitamente como sintéticas. Revisa su procedencia antes de presentar esta prueba.")
+                if not unique_ids.all():
+                    st.error("Se detectaron IDs vacíos o duplicados.")
+                if not valid_time.all():
+                    st.error("Hay tiempos de parada vacíos, no numéricos o negativos.")
+                if unique_ids.all() and valid_time.all() and simulated.all():
+                    st.success("Controles básicos superados. El dataset está identificado como sintético, tiene IDs únicos y tiempos de parada válidos.")
+                summary = (test_df.loc[valid_time].groupby("Categoria_Perdida", dropna=False)
+                           .agg(Eventos=("ID_Evento", "count"), Tiempo_Parada_Min=("Tiempo_Parada_Min", "sum"))
+                           .reset_index().sort_values("Tiempo_Parada_Min", ascending=False))
+                if not summary.empty:
+                    summary["Participacion_%"] = summary["Tiempo_Parada_Min"] / summary["Tiempo_Parada_Min"].sum() * 100
+                    st.markdown("#### Priorización por categoría")
+                    st.dataframe(summary.round(2), use_container_width=True, hide_index=True)
+                    chart = px.bar(summary, x="Categoria_Perdida", y="Tiempo_Parada_Min", text="Tiempo_Parada_Min", title="Tiempo de parada por categoría (dataset cargado)")
+                    st.plotly_chart(chart, use_container_width=True)
+                st.markdown("#### Registros utilizados")
+                st.dataframe(test_df, use_container_width=True, hide_index=True)
+        except Exception as exc:
+            st.error("No se pudo procesar el archivo. Verifica que sea un CSV o Excel válido.")
+            st.code(str(exc))
+
 elif page == "Metodología y límites":
     st.markdown("### Metodología del sistema")
     st.markdown("""
     **1. Línea base AS-IS.** Periodo histórico julio de 2024 a junio de 2025, con 12 observaciones mensuales.
 
-    **2. Disponibilidad.** Se calcula como tiempo operativo dividido entre tiempo programado, multiplicado por 100.
+    **2. Disponibilidad.** La disponibilidad global se calcula como tiempo operativo total dividido entre tiempo programado total, multiplicado por 100. La serie mensual se conserva como una serie independiente; no se reemplaza por el indicador global ni se utiliza su promedio simple como disponibilidad global.
 
     **3. Priorización.** El análisis de eventos identifica mantenimiento y setup como los motivos con mayor contribución al tiempo improductivo registrado.
 
